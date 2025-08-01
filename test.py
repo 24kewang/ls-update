@@ -33,8 +33,8 @@ class LansweeperAPI:
         self.pat_token = pat_token
         self.base_url = f"https://api.lansweeper.com/api/v2/graphql"
         self.headers = {
-            "Authorization": f"Bearer {pat_token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "Authorization": f"Token {pat_token}"
         }
     
     def get_asset_by_serial(self, serial_number: str) -> Optional[Dict[str, Any]]:
@@ -48,7 +48,7 @@ class LansweeperAPI:
             Asset data dictionary or None if not found
         """
         query = """
-        query GetAssetBySerial($siteId: String!, $serialNumber: String!) {
+        query GetAssetBySerial($siteId: ID!, $serialNumber: String!) {
             site(id: $siteId) {
                 assetResources(
                     assetPagination: { limit: 1 }
@@ -59,21 +59,18 @@ class LansweeperAPI:
                             value: $serialNumber
                         }]
                     }
+                    fields: [
+                        "key"
+                        "assetBasicInfo.name"
+                        "assetCustom.barCode"
+                        "assetCustom.serialNumber"
+                        "assetCustom.purchaseDate"
+                        "assetCustom.warrantyDate"
+                        "url"
+                    ]
                 ) {
                     total
-                    items {
-                        key
-                        assetBasicInfo {
-                            name
-                        }
-                        assetCustom {
-                            barCode
-                            serialNumber
-                            purchaseDate
-                            warrantyDate
-                        }
-                        url
-                    }
+                    items
                 }
             }
         }
@@ -126,21 +123,31 @@ class LansweeperAPI:
         # Build the custom fields update object
         custom_fields = {}
         if purchase_date:
-            custom_fields["purchaseDate"] = purchase_date
+            # Convert to ISO 8601 DateTime format and wrap in ValueDateInput object
+            iso_date = f"{purchase_date}T00:00:00Z"
+            custom_fields["purchaseDate"] = {"value": iso_date}
         if warranty_date:
-            custom_fields["warrantyDate"] = warranty_date
-        
+            # Convert to ISO 8601 DateTime format and wrap in ValueDateInput object  
+            iso_date = f"{warranty_date}T00:00:00Z"
+            custom_fields["warrantyDate"] = {"value": iso_date}
+
         if not custom_fields:
             return True  # Nothing to update
         
         mutation = """
-        mutation UpdateAsset($siteId: String!, $key: String!, $customFields: AssetCustomInput!) {
-            updateAsset(
-                siteId: $siteId
-                key: $key
-                assetCustom: $customFields
-            ) {
-                key
+        mutation EditAsset($siteId: ID!, $key: ID!, $customFields: AssetCustomInput!) {
+            site(id: $siteId) {
+                editAsset(
+                    key: $key
+                    fields: {
+                        assetCustom: $customFields
+                    }
+                ) {
+                    assetCustom {
+                        purchaseDate
+                        warrantyDate
+                    }
+                }
             }
         }
         """
@@ -157,8 +164,8 @@ class LansweeperAPI:
                 headers=self.headers,
                 json={"query": mutation, "variables": variables}
             )
-            response.raise_for_status()
-            
+            # response.raise_for_status()
+            logging.info(f"Update response status code: {response.json()}")
             data = response.json()
             if 'errors' in data:
                 logging.error(f"Update failed for asset {asset_key}: {data['errors']}")
@@ -184,30 +191,44 @@ def parse_date(date_str: str) -> Optional[str]:
     if pd.isna(date_str) or date_str == '':
         return None
     
+    # Convert to string if it's not already
+    date_str = str(date_str).strip()
+    
     # Try different date formats
-    # date_formats = [
-    #     '%Y-%m-%d',
-    #     '%m/%d/%Y',
-    #     '%d/%m/%Y',
-    #     '%Y/%m/%d',
-    #     '%m-%d-%Y',
-    #     '%d-%m-%Y'
-    # ]
-
-    # for fmt in date_formats:
-    #     try:
-    #         parsed_date = datetime.strptime(str(date_str), fmt)
-    #         return parsed_date.strftime('%Y-%m-%d')
-    #     except ValueError:
-    #         continue
-
+    date_formats = [
+        # ISO formats (from GraphQL responses)
+        '%Y-%m-%dT%H:%M:%S.%fZ',      # 2024-11-08T00:00:00.000Z
+        '%Y-%m-%dT%H:%M:%SZ',         # 2024-11-08T00:00:00Z  LS currently uses this format
+        '%Y-%m-%d %H:%M:%S',          # 2024-11-08 00:00:00  xslx uses this format
+        '%Y-%m-%dT%H:%M:%S',          # 2024-11-08T00:00:00
+        # Standard date formats
+        '%Y-%m-%d',                   # 2024-11-08
+        '%m/%d/%Y',                   # 11/08/2024
+        '%d/%m/%Y',                   # 08/11/2024
+        '%Y/%m/%d',                   # 2024/11/08
+        '%m-%d-%Y',                   # 11-08-2024
+        '%d-%m-%Y',                   # 08-11-2024
+        # Excel date formats
+        '%m/%d/%y',                   # 11/8/24
+        '%d/%m/%y',                   # 8/11/24
+    ]
+    
+    for fmt in date_formats:
+        try:
+            parsed_date = datetime.strptime(date_str, fmt)
+            return parsed_date.strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    
+    # Try to handle pandas Timestamp objects
     try:
-        # Attempt to parse as MM/DD/YYYY format
-        parsed_date = datetime.strptime(str(date_str), '%m/%d/%Y')
-        return parsed_date.strftime('%Y-%m-%d')
-    except ValueError:
-        logging.warning(f"Could not parse date: {date_str}")
-        return None
+        if hasattr(date_str, 'strftime'):
+            return date_str.strftime('%Y-%m-%d')
+    except:
+        pass
+    
+    logging.warning(f"Could not parse date: {date_str}")
+    return None
 
 def compare_values(spreadsheet_val, lansweeper_val, field_name: str) -> bool:
     """
@@ -261,7 +282,7 @@ def main():
         df = pd.read_excel(SPREADSHEET_PATH)
         
         # Verify required columns exist
-        required_columns = ['Serial Number', 'Barcode', 'Purchase Date', 'Warranty Date']
+        required_columns = ['Serial Number', 'Barcode Number', 'Invoice Date', 'Extended Warranty']
         missing_columns = [col for col in required_columns if col not in df.columns]
         if missing_columns:
             raise ValueError(f"Missing required columns: {missing_columns}")
@@ -282,18 +303,23 @@ def main():
                 
                 # Get asset from Lansweeper
                 asset = api.get_asset_by_serial(str(serial_number))
+
+                logging.info(f"Retrieved Asset data structure: {json.dumps(asset, indent=2)}")
+
                 if not asset:
                     discrepancy_file.write(f"ERROR: Asset not found for serial number: {serial_number}\n\n")
                     continue
                 
                 # Extract values
-                ls_barcode = asset['assetBasicInfo'].get('barcode', '')
+                ls_barcode = asset['assetCustom'].get('barCode', '')
                 ls_purchase_date = asset['assetCustom'].get('purchaseDate', '') if asset.get('assetCustom') else ''
                 ls_warranty_date = asset['assetCustom'].get('warrantyDate', '') if asset.get('assetCustom') else ''
                 
-                spreadsheet_barcode = row['Barcode']
-                spreadsheet_purchase_date = row['Purchase Date']
-                spreadsheet_warranty_date = row['Warranty Date']
+                spreadsheet_barcode = row['Barcode Number']
+                spreadsheet_purchase_date = row['Invoice Date']
+                spreadsheet_warranty_date = row['Extended Warranty']
+
+                # logging.info(f"Spreadsheet values: Barcode='{spreadsheet_barcode}', Purchase Date='{spreadsheet_purchase_date}', Warranty Date='{spreadsheet_warranty_date}'")
                 
                 # Track discrepancies
                 discrepancies = []
