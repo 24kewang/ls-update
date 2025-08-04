@@ -4,6 +4,7 @@ import json
 from datetime import datetime
 import logging
 import os
+import time
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 
@@ -36,6 +37,16 @@ class LansweeperAPI:
             "Content-Type": "application/json",
             "Authorization": f"Token {pat_token}"
         }
+        self.request_count = 0
+    
+    def _check_rate_limit(self):
+        """Check if we need to wait due to rate limiting"""
+        # Lansweeper API allows 150 requests per minute, we will use 140 to stay under
+        if self.request_count >= 140:
+            logging.info("Rate limit reached (140 requests). Waiting 1 minute...")
+            time.sleep(60)
+            self.request_count = 0
+            logging.info("Rate limit wait complete. Continuing...")
     
     def get_asset_by_serial(self, serial_number: str) -> Optional[Dict[str, Any]]:
         """
@@ -47,6 +58,9 @@ class LansweeperAPI:
         Returns:
             Asset data dictionary or None if not found
         """
+        self._check_rate_limit()
+        self.request_count += 1
+        
         query = """
         query GetAssetBySerial($siteId: ID!, $serialNumber: String!) {
             site(id: $siteId) {
@@ -108,31 +122,38 @@ class LansweeperAPI:
             logging.error(f"Unexpected response structure for serial {serial_number}: {e}")
             return None
     
-    def update_asset(self, asset_key: str, purchase_date: str = None, warranty_date: str = None) -> bool:
+    def update_asset(self, asset_key: str, serial_number: str, fields_to_update: Dict[str, str]) -> bool:
         """
         Update asset information
         
         Args:
             asset_key: The asset key/ID
-            purchase_date: Purchase date in YYYY-MM-DD format
-            warranty_date: Warranty date in YYYY-MM-DD format
+            fields_to_update: Dictionary of field names and values to update
+                            e.g., {'purchaseDate': '2024-01-01', 'warrantyDate': '2025-01-01', 'barCode': 'BC123'}
             
         Returns:
             True if successful, False otherwise
         """
+        self._check_rate_limit()
+        self.request_count += 1
+        
+        if not fields_to_update:
+            return True  # Nothing to update
+        
         # Build the custom fields update object
         custom_fields = {}
-        if purchase_date:
-            # Convert to ISO 8601 DateTime format and wrap in ValueDateInput object
-            iso_date = f"{purchase_date}T00:00:00Z"
-            custom_fields["purchaseDate"] = {"value": iso_date}
-        if warranty_date:
-            # Convert to ISO 8601 DateTime format and wrap in ValueDateInput object  
-            iso_date = f"{warranty_date}T00:00:00Z"
-            custom_fields["warrantyDate"] = {"value": iso_date}
+        for field_name, value in fields_to_update.items():
+            if field_name in ['purchaseDate', 'warrantyDate']:
+                # Convert to ISO 8601 DateTime format and wrap in ValueDateInput object
+                iso_date = parse_date(value, 'lansweeper')
+                if iso_date:
+                    custom_fields[field_name] = {"value": iso_date}
+            else:
+                # For other fields like barCode, use the value directly
+                custom_fields[field_name] = value
 
         if not custom_fields:
-            return True  # Nothing to update
+            return True  # Nothing to update after processing
         
         mutation = """
         mutation EditAsset($siteId: ID!, $key: ID!, $customFields: AssetCustomInput!) {
@@ -146,6 +167,7 @@ class LansweeperAPI:
                     assetCustom {
                         purchaseDate
                         warrantyDate
+                        barCode
                     }
                 }
             }
@@ -168,27 +190,28 @@ class LansweeperAPI:
 
             data = response.json()
             if 'errors' in data:
-                logging.error(f"Update failed for asset {asset_key}: {data['errors']}")
+                logging.error(f"Update failed for Serial {serial_number}: {data['errors']}")
                 return False
-            
-            logging.info(f"Successfully updated asset {asset_key}")
+
+            logging.info(f"Successfully updated Serial {serial_number} with fields: {list(fields_to_update.keys())}")
             return True
             
         except requests.exceptions.RequestException as e:
-            logging.error(f"Update request failed for asset {asset_key}: {e}")
+            logging.error(f"Update request failed for Serial {serial_number}: {e}")
             return False
 
-def parse_date(date_str: str) -> Optional[str]:
+def parse_date(date_str: str, output_fmt: str = 'normal') -> Optional[str]:
     """
-    Parse date string and return in YYYY-MM-DD format
+    Parse date string and return in specified format
     
     Args:
         date_str: Date string in various formats
+        output_fmt: Output format - 'normal' for YYYY-MM-DD or 'lansweeper' for ISO 8601
         
     Returns:
         Standardized date string or None if parsing fails
     """
-    if pd.isna(date_str) or date_str == '':
+    if is_empty(date_str):
         return None
     
     # Convert to string if it's not already
@@ -199,7 +222,7 @@ def parse_date(date_str: str) -> Optional[str]:
         # ISO formats (from GraphQL responses)
         '%Y-%m-%dT%H:%M:%S.%fZ',      # 2024-11-08T00:00:00.000Z
         '%Y-%m-%dT%H:%M:%SZ',         # 2024-11-08T00:00:00Z  LS currently uses this format
-        '%Y-%m-%d %H:%M:%S',          # 2024-11-08 00:00:00  xslx uses this format
+        '%Y-%m-%d %H:%M:%S',          # 2024-11-08 00:00:00  xlsx uses this format
         '%Y-%m-%dT%H:%M:%S',          # 2024-11-08T00:00:00
         # Standard date formats
         '%Y-%m-%d',                   # 2024-11-08
@@ -216,14 +239,20 @@ def parse_date(date_str: str) -> Optional[str]:
     for fmt in date_formats:
         try:
             parsed_date = datetime.strptime(date_str, fmt)
-            return parsed_date.strftime('%Y-%m-%d')
+            if output_fmt == 'lansweeper':
+                return parsed_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+            else:  # normal
+                return parsed_date.strftime('%Y-%m-%d')
         except ValueError:
             continue
     
     # Try to handle pandas Timestamp objects
     try:
         if hasattr(date_str, 'strftime'):
-            return date_str.strftime('%Y-%m-%d')
+            if output_fmt == 'lansweeper':
+                return date_str.strftime('%Y-%m-%dT%H:%M:%SZ')
+            else:  # normal
+                return date_str.strftime('%Y-%m-%d')
     except:
         pass
     
@@ -250,12 +279,46 @@ def compare_values(spreadsheet_val, lansweeper_val, field_name: str) -> bool:
     
     # For dates, normalize format
     if 'date' in field_name.lower():
-        spreadsheet_date = parse_date(spreadsheet_val)
-        lansweeper_date = parse_date(lansweeper_val)
+        spreadsheet_date = parse_date(spreadsheet_val, 'normal')
+        lansweeper_date = parse_date(lansweeper_val, 'normal')
         return spreadsheet_date == lansweeper_date
     
     # For other fields, do string comparison
     return str(spreadsheet_val).strip() == str(lansweeper_val).strip()
+
+def is_empty(value) -> bool:
+    """Check if a value is empty/null"""
+    return pd.isna(value) or value == '' or value is None or str(value).strip() == ''
+
+def get_user_choice(serial_number: str, field_name: str, spreadsheet_val: str, lansweeper_val: str) -> str:
+    """
+    Get user choice for handling conflicting values
+    
+    Returns: 'ls_to_sheet', 'sheet_to_ls', 'skip', or 'quit'
+    """
+    print(f"\n=== CONFLICT DETECTED ===")
+    print(f"Serial Number: {serial_number}")
+    print(f"Field: {field_name}")
+    print(f"Spreadsheet value: '{spreadsheet_val}'")
+    print(f"Lansweeper value: '{lansweeper_val}'")
+    print("\nOptions:")
+    print("1. Update spreadsheet with Lansweeper value")
+    print("2. Update Lansweeper with spreadsheet value") 
+    print("3. Skip this field")
+    print("4. Quit processing")
+    
+    while True:
+        choice = input("Enter your choice (1/2/3/4): ").strip()
+        if choice == '1':
+            return 'ls_to_sheet'
+        elif choice == '2':
+            return 'sheet_to_ls'
+        elif choice == '3':
+            return 'skip'
+        elif choice == '4':
+            return 'quit'
+        else:
+            print("Invalid choice. Please enter 1, 2, 3, or 4.")
 
 def main():
     # Load configuration from environment variables
@@ -287,6 +350,10 @@ def main():
         if missing_columns:
             raise ValueError(f"Missing required columns: {missing_columns}")
         
+        # Track changes made to spreadsheet
+        spreadsheet_changes = []
+        quit_processing = False
+        
         # Open discrepancies file
         with open(DISCREPANCIES_FILE, 'a') as discrepancy_file:
             discrepancy_file.write("\n" + "=" * 80 + "\n")
@@ -295,8 +362,11 @@ def main():
             
             # Process each row
             for index, row in df.iterrows():
+                if quit_processing:
+                    break
+                    
                 serial_number = row['Serial Number']
-                if pd.isna(serial_number):
+                if is_empty(serial_number):
                     logging.warning(f"Skipping row {index + 1}: No serial number")
                     continue
                 
@@ -305,10 +375,9 @@ def main():
                 # Get asset from Lansweeper
                 asset = api.get_asset_by_serial(str(serial_number))
 
-                # logging.info(f"Retrieved Asset data structure: {json.dumps(asset, indent=2)}")
-
                 if not asset:
                     discrepancy_file.write(f"ERROR: Asset not found for serial number: {serial_number}\n\n")
+                    logging.error(f"Asset not found for serial number: {serial_number}")
                     continue
                 
                 logging.info(f"Retrieved asset for serial {serial_number}: {asset['assetBasicInfo']['name']}")
@@ -318,68 +387,121 @@ def main():
                 ls_purchase_date = asset['assetCustom'].get('purchaseDate', '') if asset.get('assetCustom') else ''
                 ls_warranty_date = asset['assetCustom'].get('warrantyDate', '') if asset.get('assetCustom') else ''
                 
-                spreadsheet_barcode = row['Barcode Number']
+                spreadsheet_barcode = str(int(row['Barcode Number'])) if not is_empty(row['Barcode Number']) else ''
                 spreadsheet_purchase_date = row['Invoice Date']
                 spreadsheet_warranty_date = row['Extended Warranty']
 
-                # logging.info(f"Spreadsheet values: Barcode='{spreadsheet_barcode}', Purchase Date='{spreadsheet_purchase_date}', Warranty Date='{spreadsheet_warranty_date}'")
+                # Track updates needed for LS
+                ls_updates = {}
                 
-                # Track discrepancies
-                discrepancies = []
+                # Process each field
+                fields_to_process = [
+                    ('Barcode Number', 'barCode', spreadsheet_barcode, ls_barcode),
+                    ('Invoice Date', 'purchaseDate', spreadsheet_purchase_date, ls_purchase_date),
+                    ('Extended Warranty', 'warrantyDate', spreadsheet_warranty_date, ls_warranty_date)
+                ]
                 
-                # Compare barcode
-                if not compare_values(spreadsheet_barcode, ls_barcode, 'barcode'):
-                    discrepancies.append(f"  Barcode: Spreadsheet='{spreadsheet_barcode}' vs Lansweeper='{ls_barcode}'")
+                for field_display_name, field_ls_name, sheet_val, ls_val in fields_to_process:
+                    if quit_processing:
+                        break
+                        
+                    sheet_empty = is_empty(sheet_val)
+                    ls_empty = is_empty(ls_val)
+                    
+                    if sheet_empty and ls_empty:
+                        # Both empty - log but continue
+                        discrepancy_file.write(f"Serial {serial_number} - {field_display_name}: Both values are empty\n")
+                        logging.info(f"Serial {serial_number} - {field_display_name}: Both values are empty")
+                        
+                    elif sheet_empty and not ls_empty:
+                        # Spreadsheet empty, LS has value - update spreadsheet
+                        normalized_ls_val = parse_date(ls_val, 'normal') if 'date' in field_ls_name.lower() else ls_val
+                        df.at[index, field_display_name] = normalized_ls_val
+                        spreadsheet_changes.append(f"Row {index + 1}: Updated {field_display_name} from empty to '{normalized_ls_val}'")
+                        discrepancy_file.write(f"Serial {serial_number} - {field_display_name}: Updated spreadsheet from empty to '{normalized_ls_val}'\n")
+                        logging.info(f"Serial {serial_number} - {field_display_name}: Updated spreadsheet from empty to '{normalized_ls_val}'")
+                        
+                    elif not sheet_empty and ls_empty:
+                        # LS empty, spreadsheet has value - prepare to update LS
+                        if field_ls_name in ['purchaseDate', 'warrantyDate']:
+                            normalized_sheet_val = parse_date(sheet_val, 'normal')
+                            if normalized_sheet_val:
+                                ls_updates[field_ls_name] = normalized_sheet_val
+                                discrepancy_file.write(f"Serial {serial_number} - {field_display_name}: Will update LS from empty to '{normalized_sheet_val}'\n")
+                                logging.info(f"Serial {serial_number} - {field_display_name}: Will update LS from empty to '{normalized_sheet_val}'")
+                        else:  # barCode
+                            ls_updates[field_ls_name] = str(sheet_val)
+                            discrepancy_file.write(f"Serial {serial_number} - {field_display_name}: Will update LS from empty to '{sheet_val}'\n")
+                            logging.info(f"Serial {serial_number} - {field_display_name}: Will update LS from empty to '{sheet_val}'")
+                        
+                    elif not sheet_empty and not ls_empty:
+                        # Both have values - check if they match
+                        if not compare_values(sheet_val, ls_val, field_ls_name):
+                            # Values differ - get user input
+                            normalized_sheet_val = parse_date(sheet_val, 'normal') if 'date' in field_ls_name.lower() else str(sheet_val)
+                            normalized_ls_val = parse_date(ls_val, 'normal') if 'date' in field_ls_name.lower() else str(ls_val)
+                            
+                            discrepancy_file.write(f"Serial {serial_number} - {field_display_name}: Conflict Detected\n")
+                            logging.info(f"Serial {serial_number} - {field_display_name}: Conflict Detected")
+
+                            choice = get_user_choice(serial_number, field_display_name, normalized_sheet_val, normalized_ls_val)
+                            
+                            if choice == 'quit':
+                                quit_processing = True
+                                logging.info("User chose to quit processing")
+                                break
+                            elif choice == 'ls_to_sheet':
+                                df.at[index, field_display_name] = normalized_ls_val
+                                spreadsheet_changes.append(f"Row {index + 1}: Updated {field_display_name} from '{normalized_sheet_val}' to '{normalized_ls_val}'")
+                                discrepancy_file.write(f"Serial {serial_number} - {field_display_name}: Updated spreadsheet from '{normalized_sheet_val}' to '{normalized_ls_val}'\n")
+                                logging.info(f"Serial {serial_number} - {field_display_name}: Updated spreadsheet from '{normalized_sheet_val}' to '{normalized_ls_val}'")
+                                
+                            elif choice == 'sheet_to_ls':
+                                if field_ls_name in ['purchaseDate', 'warrantyDate']:
+                                    ls_updates[field_ls_name] = normalized_sheet_val
+                                else:  # barCode
+                                    ls_updates[field_ls_name] = normalized_sheet_val
+                                discrepancy_file.write(f"Serial {serial_number} - {field_display_name}: Will update LS from '{normalized_ls_val}' to '{normalized_sheet_val}'\n")
+                                logging.info(f"Serial {serial_number} - {field_display_name}: Will update LS from '{normalized_ls_val}' to '{normalized_sheet_val}'")
+                                    
+                            else:  # skip
+                                discrepancy_file.write(f"Serial {serial_number} - {field_display_name}: SKIPPED - Sheet: '{normalized_sheet_val}' vs LS: '{normalized_ls_val}'\n")
+                                logging.info(f"Serial {serial_number} - {field_display_name}: SKIPPED - values differ")
                 
-                # Compare purchase date
-                if not compare_values(spreadsheet_purchase_date, ls_purchase_date, 'purchase_date'):
-                    discrepancies.append(f"  Purchase Date: Spreadsheet='{parse_date(spreadsheet_purchase_date)}' vs Lansweeper='{parse_date(ls_purchase_date)}'")
-                
-                # Compare warranty date
-                if not compare_values(spreadsheet_warranty_date, ls_warranty_date, 'warranty_date'):
-                    discrepancies.append(f"  Warranty Date: Spreadsheet='{parse_date(spreadsheet_warranty_date)}' vs Lansweeper='{parse_date(ls_warranty_date)}'")
-                
-                # Log discrepancies
-                if discrepancies:
-                    discrepancy_file.write(f"Serial Number: {serial_number}\n")
-                    for discrepancy in discrepancies:
-                        discrepancy_file.write(discrepancy + "\n")
-                    discrepancy_file.write("\n")
-                
-                # Update missing dates in Lansweeper
-                needs_update = False
-                update_purchase_date = None
-                update_warranty_date = None
-                
-                # Check if purchase date is missing in Lansweeper but available in spreadsheet
-                if (not ls_purchase_date or ls_purchase_date == '') and not pd.isna(spreadsheet_purchase_date):
-                    parsed_date = parse_date(spreadsheet_purchase_date)
-                    if parsed_date:
-                        update_purchase_date = parsed_date
-                        needs_update = True
-                        logging.info(f"Will update purchase date for {serial_number}: {parsed_date}")
-                
-                # Check if warranty date is missing in Lansweeper but available in spreadsheet
-                if (not ls_warranty_date or ls_warranty_date == '') and not pd.isna(spreadsheet_warranty_date):
-                    parsed_date = parse_date(spreadsheet_warranty_date)
-                    if parsed_date:
-                        update_warranty_date = parsed_date
-                        needs_update = True
-                        logging.info(f"Will update warranty date for {serial_number}: {parsed_date}")
-                
-                # Perform update if needed
-                if needs_update:
-                    success = api.update_asset(
-                        asset['key'], 
-                        update_purchase_date, 
-                        update_warranty_date
-                    )
+                # Perform all LS updates for this row in one API call
+                if ls_updates and not quit_processing:
+                    success = api.update_asset(asset['key'], serial_number, ls_updates)
                     if success:
-                        discrepancy_file.write(f"UPDATED: Serial {serial_number} - Purchase: {update_purchase_date}, Warranty: {update_warranty_date}\n\n")
+                        update_summary = ", ".join([f"{k}='{v}'" for k, v in ls_updates.items()])
+                        discrepancy_file.write(f"UPDATED LS for Serial {serial_number}: {update_summary}\n\n")
+                        logging.info(f"Successfully updated LS for Serial {serial_number}: {update_summary}")
                     else:
-                        discrepancy_file.write(f"UPDATE FAILED: Serial {serial_number}\n\n")
+                        discrepancy_file.write(f"FAILED to update LS for Serial {serial_number}: {ls_updates}\n\n")
+                        logging.error(f"Failed to update LS for Serial {serial_number}: {ls_updates}")
+                elif not quit_processing:
+                    discrepancy_file.write(f"No LS updates needed for Serial {serial_number}\n\n")
+                    
+            if quit_processing:
+                discrepancy_file.write(f"\n=== PROCESSING STOPPED BY USER ===\n\n")
         
-        logging.info(f"Processing complete. Check {DISCREPANCIES_FILE} for results.")
+        # Save spreadsheet changes if any were made
+        if spreadsheet_changes:
+            logging.info(f"Saving {len(spreadsheet_changes)} changes to spreadsheet...")
+            df.to_excel(SPREADSHEET_PATH, index=False)
+            
+            # Log all changes
+            with open(DISCREPANCIES_FILE, 'a') as discrepancy_file:
+                discrepancy_file.write("\n" + "=" * 40 + "\n")
+                discrepancy_file.write("SPREADSHEET CHANGES MADE:\n")
+                discrepancy_file.write("=" * 40 + "\n")
+                for change in spreadsheet_changes:
+                    discrepancy_file.write(f"{change}\n")
+                discrepancy_file.write("\n")
+        
+        logging.info(f"Processing complete. Total API requests made: {api.request_count}")
+        if quit_processing:
+            logging.info("Processing was stopped by user")
+        logging.info(f"Check {DISCREPANCIES_FILE} for results.")
         
     except FileNotFoundError:
         logging.error(f"Spreadsheet file not found: {SPREADSHEET_PATH}")
