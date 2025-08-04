@@ -164,8 +164,8 @@ class LansweeperAPI:
                 headers=self.headers,
                 json={"query": mutation, "variables": variables}
             )
-            # response.raise_for_status()
-            logging.info(f"Update response status code: {response.json()}")
+            response.raise_for_status()
+
             data = response.json()
             if 'errors' in data:
                 logging.error(f"Update failed for asset {asset_key}: {data['errors']}")
@@ -251,7 +251,7 @@ def compare_values(spreadsheet_val, lansweeper_val, field_name: str) -> bool:
     # For dates, normalize format
     if 'date' in field_name.lower():
         spreadsheet_date = parse_date(spreadsheet_val)
-        lansweeper_date = parse_date(lansweeper_val) if lansweeper_val else None
+        lansweeper_date = parse_date(lansweeper_val)
         return spreadsheet_date == lansweeper_date
     
     # For other fields, do string comparison
@@ -288,7 +288,8 @@ def main():
             raise ValueError(f"Missing required columns: {missing_columns}")
         
         # Open discrepancies file
-        with open(DISCREPANCIES_FILE, 'w') as discrepancy_file:
+        with open(DISCREPANCIES_FILE, 'a') as discrepancy_file:
+            discrepancy_file.write("\n" + "=" * 80 + "\n")
             discrepancy_file.write(f"Asset Discrepancy Report - Generated: {datetime.now()}\n")
             discrepancy_file.write("=" * 80 + "\n\n")
             
@@ -304,14 +305,16 @@ def main():
                 # Get asset from Lansweeper
                 asset = api.get_asset_by_serial(str(serial_number))
 
-                logging.info(f"Retrieved Asset data structure: {json.dumps(asset, indent=2)}")
+                # logging.info(f"Retrieved Asset data structure: {json.dumps(asset, indent=2)}")
 
                 if not asset:
                     discrepancy_file.write(f"ERROR: Asset not found for serial number: {serial_number}\n\n")
                     continue
                 
+                logging.info(f"Retrieved asset for serial {serial_number}: {asset['assetBasicInfo']['name']}")
+
                 # Extract values
-                ls_barcode = asset['assetCustom'].get('barCode', '')
+                ls_barcode = asset['assetCustom'].get('barCode', '') if asset.get('assetCustom') else ''
                 ls_purchase_date = asset['assetCustom'].get('purchaseDate', '') if asset.get('assetCustom') else ''
                 ls_warranty_date = asset['assetCustom'].get('warrantyDate', '') if asset.get('assetCustom') else ''
                 
@@ -330,11 +333,11 @@ def main():
                 
                 # Compare purchase date
                 if not compare_values(spreadsheet_purchase_date, ls_purchase_date, 'purchase_date'):
-                    discrepancies.append(f"  Purchase Date: Spreadsheet='{spreadsheet_purchase_date}' vs Lansweeper='{ls_purchase_date}'")
+                    discrepancies.append(f"  Purchase Date: Spreadsheet='{parse_date(spreadsheet_purchase_date)}' vs Lansweeper='{parse_date(ls_purchase_date)}'")
                 
                 # Compare warranty date
                 if not compare_values(spreadsheet_warranty_date, ls_warranty_date, 'warranty_date'):
-                    discrepancies.append(f"  Warranty Date: Spreadsheet='{spreadsheet_warranty_date}' vs Lansweeper='{ls_warranty_date}'")
+                    discrepancies.append(f"  Warranty Date: Spreadsheet='{parse_date(spreadsheet_warranty_date)}' vs Lansweeper='{parse_date(ls_warranty_date)}'")
                 
                 # Log discrepancies
                 if discrepancies:
