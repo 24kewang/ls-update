@@ -1,5 +1,26 @@
+# Environment files
 .env
-asset_update_audit.log
-assets.xlsx
-discrepancies.txt
-debug.log
+.venv/
+venv/
+ENV/
+env/
+*.env
+
+# Spreadsheet and logs
+*.xlsx
+*.txt
+*.log
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE/editor project files
+*.swp
+*.swo
+.idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
