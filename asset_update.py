@@ -324,7 +324,9 @@ def main():
     PAT_TOKEN = os.getenv('LANSWEEPER_PAT_TOKEN')
     SPREADSHEET_PATH = os.getenv('SPREADSHEET_PATH', 'assets.xlsx')  # Default to assets.xlsx
     DISCREPANCIES_FILE = os.getenv('DISCREPANCIES_FILE', 'discrepancies.txt')  # Default filename
-    
+    BARCODE_LENGTH = int(os.getenv('BARCODE_LENGTH')) # Optionally set barcode length for validation during script process
+    BARCODE_PREFIX = int(os.getenv('BARCODE_PREFIX')) # Optionally set barcode prefix for validation during script process
+
     # Validate required environment variables
     if not SITE_ID:
         logger.error("LANSWEEPER_SITE_ID environment variable is not set")
@@ -334,6 +336,7 @@ def main():
         logger.error("LANSWEEPER_PAT_TOKEN environment variable is not set")
         return
     
+    
     # Initialize API client
     api = LansweeperAPI(SITE_ID, PAT_TOKEN)
     
@@ -341,7 +344,7 @@ def main():
         # Read the spreadsheet
         logger.info(f"Reading spreadsheet: {SPREADSHEET_PATH}")
         df = pd.read_excel(SPREADSHEET_PATH)
-        
+
         # Verify required columns exist
         required_columns = ['Serial Number', 'Barcode Number', 'Invoice Date', 'Extended Warranty']
         missing_columns = [col for col in required_columns if col not in df.columns]
@@ -352,7 +355,10 @@ def main():
         spreadsheet_changes = []
         ls_changes = []
         missing_info = []
+        missing_assets = []
+        duplicate_assets = []
         conflict_info = []
+        conflicts_for_review = []
         quit_processing = False
         
         # Open discrepancies file
@@ -376,11 +382,11 @@ def main():
                 # Get asset from Lansweeper, check for correct number (1)
                 asset = api.get_asset_by_serial(str(serial_number))
                 if asset['total'] == 0:
-                    discrepancy_file.write(f"ERROR: Asset not found for serial number: {serial_number}\n\n")
+                    missing_assets.append(f"ERROR: Asset not found for serial number: {serial_number}\n")
                     logger.error(f"Asset not found for serial number: {serial_number}")
                     continue
                 elif asset['total'] > 1:
-                    discrepancy_file.write(f"WARNING: Multiple assets found for serial number: {serial_number}. Please review.\n\n")
+                    duplicate_assets.append(f"WARNING: Multiple assets found for serial number: {serial_number}.\n")
                     logger.warning(f"Multiple assets found for serial number: {serial_number}.")
                     continue
                 else:
@@ -393,8 +399,11 @@ def main():
                 # catch case where LS barcode isn't number and log accordingly
                 try:
                     int(ls_barcode) if not is_empty(ls_barcode) else ''
+                    if (BARCODE_LENGTH and len(str(ls_barcode).strip()) != BARCODE_LENGTH) or (BARCODE_PREFIX and not str(ls_barcode).strip().startswith(str(BARCODE_PREFIX))):
+                        conflicts_for_review.append(f"Row {index + 1}: Serial {serial_number} - Invalid LS Barcode Format (based on specified length and prefix) - LS: '{ls_barcode}'\n")
                 except Exception:
-                    conflict_info.append(f"Row {index + 1}: Serial {serial_number} - Invalid LS Barcode Format (not a number) - LS: '{ls_barcode}'\n")
+                    conflicts_for_review.append(f"Row {index + 1}: Serial {serial_number} - Invalid LS Barcode Format (not a number) - LS: '{ls_barcode}'\n")
+
                 ls_purchase_date = asset['assetCustom'].get('purchaseDate', '') if asset.get('assetCustom') else ''
                 ls_warranty_date = asset['assetCustom'].get('warrantyDate', '') if asset.get('assetCustom') else ''
                 
@@ -402,8 +411,10 @@ def main():
                 spreadsheet_barcode = row['Barcode Number']
                 try:
                     int(spreadsheet_barcode) if not is_empty(spreadsheet_barcode) else ''
+                    if (BARCODE_LENGTH and len(str(spreadsheet_barcode).strip()) != BARCODE_LENGTH) or (BARCODE_PREFIX and not str(spreadsheet_barcode).strip().startswith(str(BARCODE_PREFIX))):
+                        conflicts_for_review.append(f"Row {index + 1}: Serial {serial_number} - Invalid Sheet Barcode Format (based on specified length and prefix) - Sheet: '{spreadsheet_barcode}'\n")
                 except Exception:
-                    conflict_info.append(f"Row {index + 1}: Serial {serial_number} - Invalid Sheet Barcode Format (not a number) - Sheet: '{spreadsheet_barcode}'\n")
+                    conflicts_for_review.append(f"Row {index + 1}: Serial {serial_number} - Invalid Sheet Barcode Format (not a number) - Sheet: '{spreadsheet_barcode}'\n")
                 spreadsheet_purchase_date = row['Invoice Date']
                 spreadsheet_warranty_date = row['Extended Warranty']
 
@@ -452,6 +463,11 @@ def main():
                             
                             logger.info(f"Serial {serial_number} - {field_display_name}: Conflict Detected")
 
+                            # Temporary override to always use sheet value for Invoice Date
+                            # if field_ls_name != 'purchaseDate':
+                            #     choice = get_user_choice(serial_number, field_display_name, normalized_sheet_val, normalized_ls_val)
+                            # else:
+                            #     choice = 'sheet_to_ls'
                             choice = get_user_choice(serial_number, field_display_name, normalized_sheet_val, normalized_ls_val)
                             
                             if choice == 'quit':
@@ -471,7 +487,7 @@ def main():
                                 logger.info(f"Serial {serial_number} - {field_display_name}: Will update LS from '{normalized_ls_val}' to '{normalized_sheet_val}'")
                                     
                             else:  # skip
-                                conflict_info.append(f"Serial {serial_number} - {field_display_name}: SKIPPED - Sheet: '{normalized_sheet_val}' vs LS: '{normalized_ls_val}'\n")
+                                conflicts_for_review.append(f"Serial {serial_number} - {field_display_name}: UNRESOLVED - Sheet: '{normalized_sheet_val}' vs LS: '{normalized_ls_val}'\n")
                                 logger.info(f"Serial {serial_number} - {field_display_name}: SKIPPED - values differ")
                 
                 # Perform all LS updates for this row in one API call
@@ -488,14 +504,48 @@ def main():
                 discrepancy_file.write(f"\n=== PROCESSING STOPPED BY USER ===\n\n")
         
         # Save spreadsheet changes if any were made
-        if missing_info:
+        if missing_assets:
             # Log all changes
             with open(DISCREPANCIES_FILE, 'a') as discrepancy_file:
                 discrepancy_file.write("\n" + "=" * 40 + "\n")
-                discrepancy_file.write("ASSETS WITH MISSING FIELDS:\n")
+                discrepancy_file.write("MISSING ASSETS ON LS:\nAssets not found in Lansweeper but present in spreadsheet\n")
+                discrepancy_file.write("=" * 40 + "\n")
+                for missing in missing_assets:
+                    discrepancy_file.write(missing)
+        if duplicate_assets:
+            # Log all changes
+            with open(DISCREPANCIES_FILE, 'a') as discrepancy_file:
+                discrepancy_file.write("\n\n" + "=" * 40 + "\n")
+                discrepancy_file.write("DUPLICATE ASSETS:\nSpreadsheet assets with multiple entries for same serial number in Lansweeper\n")
+                discrepancy_file.write("=" * 40 + "\n")
+                for duplicate in duplicate_assets:
+                    discrepancy_file.write(duplicate)
+        if missing_info:
+            # Log all changes
+            with open(DISCREPANCIES_FILE, 'a') as discrepancy_file:
+                discrepancy_file.write("\n\n" + "=" * 40 + "\n")
+                discrepancy_file.write("ASSETS WITH MISSING FIELDS:\nAssets with missing fields in both spreadsheet and Lansweeper\n")
                 discrepancy_file.write("=" * 40 + "\n")
                 for missing in missing_info:
                     discrepancy_file.write(missing)
+        if conflicts_for_review:
+            # Log all changes
+            with open(DISCREPANCIES_FILE, 'a') as discrepancy_file:
+                discrepancy_file.write("\n\n" + "=" * 40 + "\n")
+                discrepancy_file.write("UNRESOLVED CONFLICTS:\n")
+                discrepancy_file.write("=" * 40 + "\n")
+                for conflict in conflicts_for_review:
+                    discrepancy_file.write(conflict)
+                discrepancy_file.write("\n")
+        if conflict_info:
+            # Log all changes
+            with open(DISCREPANCIES_FILE, 'a') as discrepancy_file:
+                discrepancy_file.write("\n\n" + "=" * 40 + "\n")
+                discrepancy_file.write("RESOLVED CONFLICTS:\n")
+                discrepancy_file.write("=" * 40 + "\n")
+                for conflict in conflict_info:
+                    discrepancy_file.write(conflict)
+                discrepancy_file.write("\n")
         if spreadsheet_changes:
             logger.info(f"Saving {len(spreadsheet_changes)} changes to spreadsheet...")
             df.to_excel(SPREADSHEET_PATH, index=False)
@@ -515,14 +565,6 @@ def main():
                 discrepancy_file.write("=" * 40 + "\n")
                 for change in ls_changes:
                     discrepancy_file.write(change)
-        if conflict_info:
-            # Log all changes
-            with open(DISCREPANCIES_FILE, 'a') as discrepancy_file:
-                discrepancy_file.write("\n\n" + "=" * 40 + "\n")
-                discrepancy_file.write("CONFLICTS:\n")
-                discrepancy_file.write("=" * 40 + "\n")
-                for conflict in conflict_info:
-                    discrepancy_file.write(conflict)
                 discrepancy_file.write("\n")
         
         logger.info(f"Processing complete. Total API requests made: {api.request_count}")
