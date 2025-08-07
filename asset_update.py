@@ -1,10 +1,8 @@
 import requests
 import pandas as pd
-import json
 from datetime import datetime
 import logging
 import os
-import time
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 from logging_config import setup_loggers
@@ -395,26 +393,34 @@ def main():
                 logger.info(f"Retrieved asset for serial {serial_number}: {asset['assetBasicInfo']['name']}")
 
                 # Extract values
+                barcode_issues = False
+
                 ls_barcode = asset['assetCustom'].get('barCode', '') if asset.get('assetCustom') else ''
                 # catch case where LS barcode isn't number and log accordingly
-                try:
-                    int(ls_barcode) if not is_empty(ls_barcode) else ''
-                    if (BARCODE_LENGTH and len(str(ls_barcode).strip()) != BARCODE_LENGTH) or (BARCODE_PREFIX and not str(ls_barcode).strip().startswith(str(BARCODE_PREFIX))):
-                        conflicts_for_review.append(f"Row {index + 1}: Serial {serial_number} - Invalid LS Barcode Format (based on specified length and prefix) - LS: '{ls_barcode}'\n")
-                except Exception:
-                    conflicts_for_review.append(f"Row {index + 1}: Serial {serial_number} - Invalid LS Barcode Format (not a number) - LS: '{ls_barcode}'\n")
+                if not is_empty(ls_barcode):
+                    try:
+                        int(ls_barcode)
+                        if (BARCODE_LENGTH and len(str(ls_barcode).strip()) != BARCODE_LENGTH) or (BARCODE_PREFIX and not str(ls_barcode).strip().startswith(str(BARCODE_PREFIX))):
+                            barcode_issues = True
+                            conflicts_for_review.append(f"Serial {serial_number} - Invalid LS Barcode Format (based on specified length and prefix) - LS: '{ls_barcode}'\n")
+                    except Exception:
+                        barcode_issues = True
+                        conflicts_for_review.append(f"Serial {serial_number} - Invalid LS Barcode Format (not a number) - LS: '{ls_barcode}'\n")
 
                 ls_purchase_date = asset['assetCustom'].get('purchaseDate', '') if asset.get('assetCustom') else ''
                 ls_warranty_date = asset['assetCustom'].get('warrantyDate', '') if asset.get('assetCustom') else ''
                 
                 # truncate barcode from decimal to int then convert to string, try-except to catch cases where spreadsheet barcode isn't a number and log accordingly
                 spreadsheet_barcode = row['Barcode Number']
-                try:
-                    int(spreadsheet_barcode) if not is_empty(spreadsheet_barcode) else ''
-                    if (BARCODE_LENGTH and len(str(spreadsheet_barcode).strip()) != BARCODE_LENGTH) or (BARCODE_PREFIX and not str(spreadsheet_barcode).strip().startswith(str(BARCODE_PREFIX))):
-                        conflicts_for_review.append(f"Row {index + 1}: Serial {serial_number} - Invalid Sheet Barcode Format (based on specified length and prefix) - Sheet: '{spreadsheet_barcode}'\n")
-                except Exception:
-                    conflicts_for_review.append(f"Row {index + 1}: Serial {serial_number} - Invalid Sheet Barcode Format (not a number) - Sheet: '{spreadsheet_barcode}'\n")
+                if not is_empty(spreadsheet_barcode):
+                    try:
+                        int(spreadsheet_barcode)
+                        if (BARCODE_LENGTH and len(str(spreadsheet_barcode).strip()) != BARCODE_LENGTH) or (BARCODE_PREFIX and not str(spreadsheet_barcode).strip().startswith(str(BARCODE_PREFIX))):
+                            barcode_issues = True
+                            conflicts_for_review.append(f"Serial {serial_number} - Invalid Sheet Barcode Format (based on specified length and prefix) - Sheet: '{spreadsheet_barcode}'\n")
+                    except Exception:
+                        barcode_issues = True
+                        conflicts_for_review.append(f"Serial {serial_number} - Invalid Sheet Barcode Format (not a number) - Sheet: '{spreadsheet_barcode}'\n")
                 spreadsheet_purchase_date = row['Invoice Date']
                 spreadsheet_warranty_date = row['Extended Warranty']
 
@@ -434,27 +440,30 @@ def main():
                         
                     sheet_empty = is_empty(sheet_val)
                     ls_empty = is_empty(ls_val)
+
+                    # Note FOR FUTURE UPDATE: Should set validity checks for every field and use generic proceed logic
+                    proceed = not (barcode_issues and field_ls_name == 'barCode')
+                    if proceed:
+                        if sheet_empty and ls_empty:
+                            # Both empty - log but continue
+                            missing_info.append(f"Row {index + 1}: Serial {serial_number} - {field_display_name}: Both values are empty\n")
+                            logger.info(f"Serial {serial_number} - {field_display_name}: Both values are empty")
+                            
+                        if sheet_empty and not ls_empty:
+                            # Spreadsheet empty, LS has value - update spreadsheet
+                            normalized_ls_val = parse_date(ls_val, 'normal') if 'date' in field_ls_name.lower() else str(ls_val)
+                            df.at[index, field_display_name] = normalized_ls_val
+                            spreadsheet_changes.append(f"Row {index + 1}: Serial {serial_number} - Updated {field_display_name} from empty to '{normalized_ls_val}'\n")
+                            logger.info(f"Serial {serial_number} - {field_display_name}: Updated spreadsheet from empty to '{normalized_ls_val}'")
+                            
+                        if not sheet_empty and ls_empty:
+                            # LS empty, spreadsheet has value - prepare to update LS
+                            normalized_sheet_val = parse_date(sheet_val, 'normal') if 'date' in field_ls_name.lower() else str(sheet_val)
+                            ls_updates[field_ls_name] = normalized_sheet_val
+                            ls_changes.append(f"Serial {serial_number} - {field_display_name}: Will update LS from empty to '{normalized_sheet_val}'\n")
+                            logger.info(f"Serial {serial_number} - {field_display_name}: Will update LS from empty to '{normalized_sheet_val}'")
                     
-                    if sheet_empty and ls_empty:
-                        # Both empty - log but continue
-                        missing_info.append(f"Row {index + 1}: Serial {serial_number} - {field_display_name}: Both values are empty\n")
-                        logger.info(f"Serial {serial_number} - {field_display_name}: Both values are empty")
-                        
-                    elif sheet_empty and not ls_empty:
-                        # Spreadsheet empty, LS has value - update spreadsheet
-                        normalized_ls_val = parse_date(ls_val, 'normal') if 'date' in field_ls_name.lower() else str(ls_val)
-                        df.at[index, field_display_name] = normalized_ls_val
-                        spreadsheet_changes.append(f"Row {index + 1}: Serial {serial_number} - Updated {field_display_name} from empty to '{normalized_ls_val}'\n")
-                        logger.info(f"Serial {serial_number} - {field_display_name}: Updated spreadsheet from empty to '{normalized_ls_val}'")
-                        
-                    elif not sheet_empty and ls_empty:
-                        # LS empty, spreadsheet has value - prepare to update LS
-                        normalized_sheet_val = parse_date(sheet_val, 'normal') if 'date' in field_ls_name.lower() else str(sheet_val)
-                        ls_updates[field_ls_name] = normalized_sheet_val
-                        ls_changes.append(f"Serial {serial_number} - {field_display_name}: Will update LS from empty to '{normalized_sheet_val}'\n")
-                        logger.info(f"Serial {serial_number} - {field_display_name}: Will update LS from empty to '{normalized_sheet_val}'")
-                    
-                    elif not sheet_empty and not ls_empty:
+                    if not sheet_empty and not ls_empty:
                         # Both have values - check if they match
                         if not compare_values(sheet_val, ls_val, field_ls_name):
                             # Values differ - get user input
@@ -469,19 +478,23 @@ def main():
                             # else:
                             #     choice = 'sheet_to_ls'
                             choice = get_user_choice(serial_number, field_display_name, normalized_sheet_val, normalized_ls_val)
-                            
+
                             if choice == 'quit':
                                 quit_processing = True
                                 logger.info("User chose to quit processing")
                                 break
                             elif choice == 'ls_to_sheet':
                                 df.at[index, field_display_name] = normalized_ls_val
+                                if barcode_issues and field_ls_name == 'barCode':
+                                    conflicts_for_review.append(f"Serial {serial_number} - Barcode issues RESOLVED\n")
                                 conflict_info.append(f"Override Sheet with LS value: Serial {serial_number} - Updated {field_display_name} from '{normalized_sheet_val}' to '{normalized_ls_val}'\n")
                                 spreadsheet_changes.append(f"Row {index + 1}: Serial {serial_number} - Updated {field_display_name} from '{normalized_sheet_val}' to '{normalized_ls_val}'\n")
                                 logger.info(f"Serial {serial_number} - {field_display_name}: Updated spreadsheet from '{normalized_sheet_val}' to '{normalized_ls_val}'")
                                 
                             elif choice == 'sheet_to_ls':
                                 ls_updates[field_ls_name] = normalized_sheet_val
+                                if barcode_issues and field_ls_name == 'barCode':
+                                    conflicts_for_review.append(f"Serial {serial_number} - Barcode issues RESOLVED\n")
                                 conflict_info.append(f"Override LS with Sheet value: Serial {serial_number} - Updated {field_display_name} from '{normalized_ls_val}' to '{normalized_sheet_val}'\n")
                                 ls_changes.append(f"Serial {serial_number} - {field_display_name}: Will update LS from '{normalized_ls_val}' to '{normalized_sheet_val}'\n")
                                 logger.info(f"Serial {serial_number} - {field_display_name}: Will update LS from '{normalized_ls_val}' to '{normalized_sheet_val}'")
